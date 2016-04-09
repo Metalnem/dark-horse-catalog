@@ -5,16 +5,31 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 )
 
-const url = "https://digital.darkhorse.com/browse/all/"
+const baseURL = "https://digital.darkhorse.com/browse/all/"
 const maxRequests = 10
 
 var errNoPages = errors.New("Could not find any page in the comic book catalog")
 var errInvalidNumberOfPages = errors.New("Invalid number of pages in the comic book catalog")
+
+func parseHTML(url string) (*html.Node, error) {
+	response, err := http.Get(url)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer response.Body.Close()
+
+	return html.Parse(response.Body)
+}
 
 func findPageSelectElement(n *html.Node) *html.Node {
 	if n.Type == html.ElementNode && n.Data == "select" {
@@ -63,15 +78,7 @@ func getNumberOfPagesFromElement(n *html.Node) (int, error) {
 }
 
 func getNumberOfPages(url string) (int, error) {
-	response, err := http.Get(url)
-
-	if err != nil {
-		return 0, err
-	}
-
-	defer response.Body.Close()
-
-	doc, err := html.Parse(response.Body)
+	doc, err := parseHTML(url)
 
 	if err != nil {
 		return 0, err
@@ -86,12 +93,90 @@ func getNumberOfPages(url string) (int, error) {
 	return getNumberOfPagesFromElement(pageSelectElement)
 }
 
+func getAttributes(n *html.Node) map[string]string {
+	attributes := make(map[string]string)
+
+	for _, attr := range n.Attr {
+		attributes[attr.Key] = attr.Val
+	}
+
+	return attributes
+}
+
+func getNames(url string) []string {
+	var names []string
+
+	if doc, err := parseHTML(url); err == nil {
+		var f func(n *html.Node)
+
+		f = func(n *html.Node) {
+			if n.Type == html.ElementNode && n.Data == "a" {
+				attr := getAttributes(n)
+				class, title := attr["class"], attr["title"]
+
+				if strings.HasPrefix(class, "cover ") && title != "" {
+					names = append(names, title)
+					return
+				}
+			}
+
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				f(c)
+			}
+		}
+
+		f(doc)
+	}
+
+	return names
+}
+
 func main() {
-	count, err := getNumberOfPages(url)
+	count, err := getNumberOfPages(baseURL)
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(count)
+	var wg sync.WaitGroup
+	wg.Add(maxRequests)
+
+	urls := make(chan string)
+	names := make(chan string)
+	result := make(chan []string)
+
+	for i := 0; i < maxRequests; i++ {
+		go func() {
+			defer wg.Done()
+
+			for url := range urls {
+				for _, name := range getNames(url) {
+					names <- name
+				}
+			}
+		}()
+	}
+
+	go func() {
+		var sorted []string
+
+		for name := range names {
+			sorted = append(sorted, name)
+		}
+
+		sort.Strings(sorted)
+		result <- sorted
+	}()
+
+	for i := 0; i < count; i++ {
+		urls <- fmt.Sprintf("%s?page=%d", baseURL, i+1)
+	}
+
+	close(urls)
+	wg.Wait()
+	close(names)
+
+	for _, name := range <-result {
+		fmt.Println(name)
+	}
 }
